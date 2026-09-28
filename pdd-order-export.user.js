@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多買家訂單匯出 (增強版)
 // @namespace    https://github.com/DSH/pdd-order-export
-// @version      1.9.1
+// @version      1.10.0
 // @description  自動攔截拼多多網頁版買家訂單資料，自動載入訂單、日期範圍篩選、自選匯出欄位（記住選項），一鍵匯出 Excel(.xlsx)/CSV。
 // @author       leolai
 // @match        https://mobile.pinduoduo.com/*
@@ -66,6 +66,7 @@
         <li>載入期間可撳橙色「<b>停止搜尋</b>」隨時停。</li>
       </ol><p>金額會自動由「分」換算做「元」；你揀過嘅匯出欄位會記住。</p>`,
       'field.range': '日期範圍', 'field.from': '從', 'field.to': '到',
+      'opt.fast': '只載到日期下限就停（快，但可能漏單）',
       'field.cols': '選擇匯出欄位（已選 {n} 項）▾', 'field.colsOpen': '收起', 'field.colsAll': '全選 / 全不選',
       'search': '搜尋 & 匯出 Excel', 'searchStop': '⏹ 停止搜尋',
       'note': '撳「搜尋」後會自動載入訂單，只匯出所揀日期範圍內嘅訂單。',
@@ -104,6 +105,7 @@
         <li>加载期间可点橙色「<b>停止搜索</b>」随时停。</li>
       </ol><p>金额会自动由「分」换算为「元」；你选过的导出字段会记住。</p>`,
       'field.range': '日期范围', 'field.from': '从', 'field.to': '到',
+      'opt.fast': '只载到日期下限就停（快，但可能漏单）',
       'field.cols': '选择导出字段（已选 {n} 项）▾', 'field.colsOpen': '收起', 'field.colsAll': '全选 / 全不选',
       'search': '搜索 & 导出 Excel', 'searchStop': '⏹ 停止搜索',
       'note': '点「搜索」后会自动加载订单，只导出所选日期范围内的订单。',
@@ -142,6 +144,7 @@
         <li>During loading you can tap the orange “<b>Stop</b>” to cancel.</li>
       </ol><p>Amounts are automatically converted from cents to CNY; your chosen columns are remembered.</p>`,
       'field.range': 'Date range', 'field.from': 'From', 'field.to': 'To',
+      'opt.fast': 'Stop early at range start (faster, may miss orders)',
       'field.cols': 'Choose columns (selected {n}) ▾', 'field.colsOpen': 'Collapse', 'field.colsAll': 'Select all / None',
       'search': 'Search & Export Excel', 'searchStop': '⏹ Stop',
       'note': 'After “Search”, orders are loaded and only those in the selected date range are exported.',
@@ -198,6 +201,7 @@
   const colLabel = (c) => t('col.' + c.key);
   const settings = {
     divide100: false,             // 若數量單位係「分」，開啟後全數除以 100
+    fastStop: false,              // 只在「已載到日期下限」就停（預設關，確保唔漏單）
     selected: Object.fromEntries(COLUMNS.map((c) => [c.key, true])),
     dateFrom: '',                 // 'YYYY-MM-DD'
     dateTo: '',
@@ -618,35 +622,87 @@
   }
 
   /* ------------------------------------------------------------------ *
+   *  滾動：拼多多訂單頁可能係 window 滾動，亦可能係內層容器滾動，
+   *  所以要兩者都試。搵內層滾動容器：overflowY=auto/scroll 而且可滾動。
+   * ------------------------------------------------------------------ */
+  let scrollerEl = null;
+  function findScroller() {
+    try {
+      let best = null, bestDiff = 0;
+      const check = (el) => {
+        if (!el || el.clientHeight == null) return;
+        const diff = el.scrollHeight - el.clientHeight;
+        if (diff > bestDiff && el.clientHeight > 200) {
+          let ov = '';
+          try { ov = getComputedStyle(el).overflowY; } catch (e) {}
+          if (/(auto|scroll)/.test(ov)) { best = el; bestDiff = diff; }
+        }
+      };
+      check(document.scrollingElement); check(document.documentElement); check(document.body);
+      for (const el of document.querySelectorAll('div,main,section,ul')) check(el);
+      return best;
+    } catch (e) { return null; }
+  }
+  function scrollToBottom() {
+    try { window.scrollTo(0, document.body.scrollHeight); } catch (e) {}
+    try { document.documentElement.scrollTop = document.documentElement.scrollHeight; } catch (e) {}
+    try { document.body.scrollTop = document.body.scrollHeight; } catch (e) {}
+    if (!scrollerEl) scrollerEl = findScroller();
+    if (scrollerEl) { try { scrollerEl.scrollTop = scrollerEl.scrollHeight; } catch (e) {} }
+  }
+  function scrollToTop() {
+    try { window.scrollTo(0, 0); } catch (e) {}
+    try { document.documentElement.scrollTop = 0; } catch (e) {}
+    try { document.body.scrollTop = 0; } catch (e) {}
+    if (!scrollerEl) scrollerEl = findScroller();
+    if (scrollerEl) { try { scrollerEl.scrollTop = 0; } catch (e) {} }
+  }
+  function scrollPos() {
+    let p = 0;
+    try { p += window.scrollY || window.pageYOffset || 0; } catch (e) {}
+    try { p += document.documentElement.scrollTop || 0; } catch (e) {}
+    try { p += document.body.scrollTop || 0; } catch (e) {}
+    if (scrollerEl) { try { p += scrollerEl.scrollTop || 0; } catch (e) {} }
+    return p;
+  }
+
+  /* ------------------------------------------------------------------ *
    *  自動載入：往下滾動，直到載晒「指定日期範圍」嘅訂單（新→舊所以唔使載晒全部）
    * ------------------------------------------------------------------ */
   async function autoLoadAll() {
     if (autoLoading) return;
     autoLoading = true;
     setStatus(t('status.loading'));
+    scrollerEl = findScroller();
     // 先返最頂，確保係由「最新」開始向下載，提早停止先至可靠
-    try { window.scrollTo(0, 0); } catch (e) {}
-    await sleep(350);
+    scrollToTop();
+    await sleep(400);
     scanDom();
     let prev = Object.keys(ORDER).length;
     let stable = 0;
     let passedStart = 0;
+    let posStable = 0;
+    let lastPos = scrollPos();
     const startAt = Date.now();
     for (let i = 0; i < 260; i++) {
-      window.scrollTo(0, document.body.scrollHeight);
+      scrollToBottom();
       await sleep(600);
       scanDom();                                              // 每輪都讀返已渲染嘅卡片
       const n = Object.keys(ORDER).length;
       if (n === prev) { stable++; } else { stable = 0; prev = n; }
+      // 追蹤位置有冇郁（郁唔到 = 冇得再滾，可能已經到底）
+      const pos = scrollPos();
+      if (pos === lastPos) posStable++; else posStable = 0;
+      lastPos = pos;
       renderStats();
       if (cancelled) break;                                    // 用戶停止
-      // 若設咗「從」日期，而且已載到「比從日期仲舊」嘅訂單 => 範圍已覆蓋，可以停
-      if (settings.dateFrom) {
+      // 「快速模式」先會用日期下限提早停（預設關，寧願載多啲都唔想漏單）
+      if (settings.fastStop && settings.dateFrom) {
         const od = oldestDate();
         if (od && od <= settings.dateFrom) passedStart++; else passedStart = 0;
         if (passedStart >= 3) break;
       }
-      if (stable >= 5) break;                                  // 到底
+      if (stable >= 5 && posStable >= 3) break;                // 冇新訂單 + 滾唔郁 => 到底
       if (Date.now() - startAt > 45000) break;                 // 硬上限
     }
     autoLoading = false;
@@ -713,6 +769,7 @@
       helpOk: host.querySelector('.pdd-help-ok'),
       helpBody: host.querySelector('.pdd-help-body'),
       lang: host.querySelector('.pdd-lang'),
+      fastStop: host.querySelector('.pdd-fast'),
     };
 
     els.fab.addEventListener('click', () => els.panel.classList.toggle('pdd-open'));
@@ -739,6 +796,7 @@
       setTimeout(() => els.root.removeAttribute('data-theme-switching'), 320);
     });
     els.lang.addEventListener('change', () => { setLocale(els.lang.value); applyI18n(); });
+    els.fastStop.addEventListener('change', () => { settings.fastStop = els.fastStop.checked; });
     const openHelp = () => els.help.classList.add('pdd-open');
     const closeHelp = () => els.help.classList.remove('pdd-open');
     els.helpbtn.addEventListener('click', openHelp);
@@ -748,6 +806,7 @@
     // 日期範圍唔記，每次重新開始（留空）
     els.from.value = '';
     els.to.value = '';
+    els.fastStop.checked = settings.fastStop;
 
     applyI18n();
     setStatus(t('status.idle'));
@@ -822,6 +881,47 @@
       if (!max || d > max) max = d;
     }
     return { min, max };
+  }
+
+  // 診斷：把所有關鍵資訊一次過 dump 出嚟
+  function diag() {
+    const out = {};
+    try { out.url = location.href; } catch (e) {}
+    try { out.title = document.title; } catch (e) {}
+    out.captured = Object.keys(ORDER).length;
+    out.span = capturedSpan();
+    out.detectedRange = { from: settings.dateFrom, to: settings.dateTo };
+    out.interceptCount = interceptCount;
+    out.lastUrl = lastUrl;
+    out.samples = interceptSamples.slice(0, 6);
+    // DOM：各種候選 selector 命中數
+    out.selectors = {};
+    for (const sel of ['[data-order-sn]', '.order-item', '[class*="order"]', '[class*="Order"]', 'a[href*="order"]']) {
+      try { out.selectors[sel] = document.querySelectorAll(sel).length; } catch (e) { out.selectors[sel] = 'err'; }
+    }
+    // 第一張卡嘅真實 attribute / dataset / 文字
+    try {
+      const card = document.querySelector('[data-order-sn]') || document.querySelector('.order-item') || document.querySelector('[class*="order"]');
+      if (card) {
+        out.card = { tag: card.tagName, cls: String(card.className).slice(0, 120) };
+        const attrs = {};
+        for (const a of card.attributes) attrs[a.name] = String(a.value).slice(0, 80);
+        out.card.attrs = attrs;
+        out.card.dataset = Object.assign({}, card.dataset);
+        out.card.text = (card.textContent || '').replace(/\s+/g, ' ').slice(0, 240);
+      }
+    } catch (e) { out.cardErr = String(e); }
+    // 滾動資訊
+    scrollerEl = scrollerEl || findScroller();
+    out.scroll = {
+      y: (function () { try { return window.scrollY; } catch (e) { return null; } })(),
+      docTop: (function () { try { return document.documentElement.scrollTop; } catch (e) { return null; } })(),
+      bodyH: (function () { try { return document.body.scrollHeight; } catch (e) { return null; } })(),
+      docH: (function () { try { return document.documentElement.scrollHeight; } catch (e) { return null; } })(),
+      innerH: (function () { try { return window.innerHeight; } catch (e) { return null; } })(),
+      scroller: scrollerEl ? { tag: scrollerEl.tagName, cls: String(scrollerEl.className).slice(0, 80), h: scrollerEl.scrollHeight, clientH: scrollerEl.clientHeight, top: scrollerEl.scrollTop } : null,
+    };
+    return out;
   }
 
   function scheduleRender() {
@@ -1055,6 +1155,10 @@
       border:1px solid var(--pdd-input-border);border-radius:7px;padding:8px;font-size:13px;
       transition:border-color .16s ease,box-shadow .16s ease;}
     .pdd-field input[type=date]:focus{outline:none;border-color:var(--pdd-green);box-shadow:0 0 0 3px rgba(47,163,106,.18);}
+    .pdd-opt{display:flex;align-items:flex-start;gap:6px;font-size:11.5px;color:var(--pdd-muted);cursor:pointer;
+      margin:-8px 0 16px;line-height:1.45;transition:color .16s ease;}
+    .pdd-opt:hover{color:var(--pdd-sub);}
+    .pdd-opt input{accent-color:var(--pdd-check);margin-top:1px;flex:none;}
     .pdd-search{width:100%;border:none;border-radius:9px;padding:12px;font-size:15px;font-weight:600;color:#fff;
       background:var(--pdd-green);cursor:pointer;margin-top:2px;
       transition:transform .14s cubic-bezier(.22,1,.36,1),background-color .16s ease,box-shadow .16s ease;}
@@ -1128,6 +1232,7 @@
         <label data-i18n="field.from">從</label><input type="date" class="pdd-from">
         <label data-i18n="field.to">到</label><input type="date" class="pdd-to">
       </div>
+      <label class="pdd-opt"><input type="checkbox" class="pdd-fast"><span data-i18n="opt.fast">只載到日期下限就停（快，但可能漏單）</span></label>
 
       <button class="pdd-cols-toggle">選擇匯出欄位（已選 11 項）▾</button>
       <div class="pdd-cols-wrap">
@@ -1184,6 +1289,7 @@
   unsafeWindow.__pddOrderExport = {
     ORDER, RAW, filtered, settings,
     exportXlsx, exportCsv, autoLoadAll, scanPage, cancelSearch, scanDom, collectFromDom,
+    diag, findScroller, scrollToBottom, scrollToTop, capturedSpan,
     debug: (on = true) => { unsafeWindow.__pddDebug = !!on; },
     theme: () => ({ mode: themeMode, dark: effectiveDark() }),
     setTheme: (m) => { themeMode = m || ''; store.set('theme', themeMode); if (els) applyTheme(); },
