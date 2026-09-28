@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多買家訂單匯出 (增強版)
 // @namespace    https://github.com/DSH/pdd-order-export
-// @version      1.10.0
+// @version      1.11.0
 // @description  自動攔截拼多多網頁版買家訂單資料，自動載入訂單、日期範圍篩選、自選匯出欄位（記住選項），一鍵匯出 Excel(.xlsx)/CSV。
 // @author       leolai
 // @match        https://mobile.pinduoduo.com/*
@@ -427,6 +427,30 @@
     interceptSamples.push({ url, shape, len: (text || '').length, hasOrderSn: /\b(?:orderSn|order_sn|orderId)\b/.test(text || '') });
   }
 
+  /* ------------------------------------------------------------------ *
+   *  記錄 order_list_v4 嘅「請求」（url + body）
+   *  用途：自己直接分頁呼叫 API，唔靠滾動，確保攞齊所有訂單
+   *  （包括由快取還原、從未經過攔截嘅頂部最新訂單）
+   * ------------------------------------------------------------------ */
+  let lastOrderReq = null;
+  function noteOrderReq(url, body) {
+    try {
+      if (!url || String(url).indexOf('order_list_v4') === -1) return;
+      lastOrderReq = { url: String(url), body: body == null ? '' : String(body) };
+      dbg('order_list_v4 req noted');
+    } catch (e) {}
+  }
+
+  // 由原始訂單物件直接取日期（YYYY-MM-DD），唔使經 normalize
+  function rawDate(o) {
+    try {
+      const t = o.order_time != null ? o.order_time
+              : (o.orderTime != null ? o.orderTime
+              : (o.sortId ? Number(String(o.sortId).slice(0, 10)) : null));
+      return t != null ? fmtTime(t).slice(0, 10) : '';
+    } catch (e) { return ''; }
+  }
+
   function handleJson(url, text) {
     interceptCount++;
     lastUrl = url;
@@ -562,6 +586,81 @@
   }
 
   /* ------------------------------------------------------------------ *
+   *  直接分頁呼叫 order_list_v4（最可靠）
+   *  由 offset 0 開始，一頁一頁攞，唔靠滾動／唔靠 UI 有冇 render。
+   *  因為係新→舊，所以若已越過「從」日期就可以停。
+   * ------------------------------------------------------------------ */
+  function resolveOrderApiUrl() {
+    if (lastOrderReq && lastOrderReq.url) return lastOrderReq.url;
+    // 後備 1：由 performance 資源記錄搵返
+    try {
+      const entries = performance.getEntriesByType('resource') || [];
+      for (const e of entries) if (e.name && e.name.indexOf('order_list_v4') !== -1) return e.name;
+    } catch (e) {}
+    // 後備 2：用 cookie 嘅 pdd_user_id 砌返
+    try {
+      const m = String(document.cookie || '').match(/(?:^|;\s*)pdd_user_id=([^;]+)/);
+      if (m) return location.origin + '/proxy/api/api/aristotle/order_list_v4?pdduid=' + m[1];
+    } catch (e) {}
+    return null;
+  }
+
+  async function fetchAllByApi() {
+    const url = resolveOrderApiUrl();
+    if (!url) { dbg('no order_list_v4 url'); return false; }
+    let base;
+    try { base = new URL(url, location.href); } catch (e) { return false; }
+    let tmpl = {};
+    try { if (lastOrderReq && lastOrderReq.body) tmpl = JSON.parse(lastOrderReq.body) || {}; } catch (e) { tmpl = {}; }
+    if (!tmpl || typeof tmpl !== 'object' || Array.isArray(tmpl)) tmpl = {};
+    if (tmpl.size == null) tmpl.size = 50;
+    const size = Number(tmpl.size) > 0 ? Number(tmpl.size) : 50;
+
+    let offset = 0, page = 1, runMin = null, gotAny = false, prevFirst = null;
+    let effSize = size;
+    for (let i = 0; i < 300; i++) {
+      if (cancelled) break;
+      const body = Object.assign({}, tmpl, { offset: offset, page: page, size: size });
+      let json = null;
+      try {
+        const r = await fetch(base.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Accept': 'application/json, text/plain, */*' },
+          body: JSON.stringify(body),
+          credentials: 'include',
+        });
+        if (!r || r.status >= 400) { dbg('api page http ' + (r && r.status)); break; }
+        json = await r.json();
+      } catch (e) { dbg('api page err ' + (e && e.message)); break; }
+
+      const list = (json && (json.orders || (json.result && (json.result.orders || json.result.list)))) || [];
+      if (!Array.isArray(list) || !list.length) { dbg('api page ' + page + ' empty -> stop'); break; }
+      gotAny = true;
+      // 用第一頁實際長度做「頁長」基準（API 可能唔跟我們要求嘅 size）
+      if (page === 1) effSize = list.length || size;
+      // 防止 API 唔理 offset 造成無限迴圈
+      const firstSn = getOrderSn(list[0]) || '';
+      if (firstSn && firstSn === prevFirst) { dbg('api page ' + page + ' repeated -> stop'); break; }
+      prevFirst = firstSn;
+
+      for (const o of list) {
+        const d = rawDate(o);
+        if (d && (!runMin || d < runMin)) runMin = d;
+        addOrder(o, 'API 分頁');
+      }
+      renderStats();
+      dbg('api page ' + page + ' off=' + offset + ' got=' + list.length + ' min=' + runMin);
+      if (list.length < effSize) break;                    // 最後一頁
+      // 已越過「從」日期 => 後面更舊，唔使再攞（快速模式）
+      if (settings.fastStop && settings.dateFrom && runMin && runMin <= settings.dateFrom) break;
+      offset += effSize; page++;
+      await sleep(120);
+    }
+    dbg('api paging done. pages=' + page + ' spanMin=' + runMin);
+    return gotAny;
+  }
+
+  /* ------------------------------------------------------------------ *
    *  網路攔截：hook fetch + XMLHttpRequest
    * ------------------------------------------------------------------ */
   function hookNetwork() {
@@ -570,6 +669,7 @@
       const origFetch = W.fetch;
       const hooked = function (input, init) {
         const url = typeof input === 'string' ? input : (input && input.url) || '';
+        try { noteOrderReq(url, init && init.body); } catch (e) {}
         return origFetch.apply(this, arguments).then((resp) => {
           try {
             if (resp && typeof resp.clone === 'function') {
@@ -592,8 +692,9 @@
         this.__pddUrl = url;
         return origOpen.apply(this, arguments);
       };
-      XHR.prototype.send = function () {
+      XHR.prototype.send = function (body) {
         try {
+          noteOrderReq(this.__pddUrl || '', body);
           const self = this;
           this.addEventListener('load', function () {
             try {
@@ -938,12 +1039,15 @@
     setButton(t('searchStop'), true);
     setStatus(t('status.searching'));
     try {
-      await autoLoadAll();                 // 向下滾動，網路攔截自動累積
+      scanDom();                                   // 先掃已渲染卡片（若有）
+      const ok = await fetchAllByApi();             // ★ 主力：自己分頁呼叫 order_list_v4，攞齊所有訂單
       if (cancelled) { renderStats(); return; }
-      if (Object.keys(ORDER).length === 0) {
-        await scanPage();                  // 只有網路完全捉唔到先掃描（有時間上限）
+      if (!ok) {
+        await autoLoadAll();                        // 後備：滾動 + 攔截 + DOM
+        if (cancelled) { renderStats(); return; }
+        if (Object.keys(ORDER).length === 0) await scanPage();   // 最後後備：React 狀態
+        if (cancelled) { renderStats(); return; }
       }
-      if (cancelled) { renderStats(); return; }
       renderStats();
       const rows = currentRows();          // 依日期範圍過濾
       if (!rows.length) { setStatus(t('status.none')); return; }
@@ -1289,7 +1393,7 @@
   unsafeWindow.__pddOrderExport = {
     ORDER, RAW, filtered, settings,
     exportXlsx, exportCsv, autoLoadAll, scanPage, cancelSearch, scanDom, collectFromDom,
-    diag, findScroller, scrollToBottom, scrollToTop, capturedSpan,
+    diag, findScroller, scrollToBottom, scrollToTop, capturedSpan, fetchAllByApi,
     debug: (on = true) => { unsafeWindow.__pddDebug = !!on; },
     theme: () => ({ mode: themeMode, dark: effectiveDark() }),
     setTheme: (m) => { themeMode = m || ''; store.set('theme', themeMode); if (els) applyTheme(); },
