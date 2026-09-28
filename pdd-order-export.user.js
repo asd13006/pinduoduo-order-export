@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多買家訂單匯出 (增強版)
 // @namespace    https://github.com/DSH/pdd-order-export
-// @version      1.11.0
+// @version      1.12.0
 // @description  自動攔截拼多多網頁版買家訂單資料，自動載入訂單、日期範圍篩選、自選匯出欄位（記住選項），一鍵匯出 Excel(.xlsx)/CSV。
 // @author       leolai
 // @match        https://mobile.pinduoduo.com/*
@@ -32,6 +32,14 @@
   let lastUrl = '';               // 最後攔截 URL（偵錯）
 
   const dbg = (...a) => { try { if (unsafeWindow.__pddDebug) console.log('[pdd-export]', ...a); } catch (e) {} };
+
+  // 版本號（優先取 Tampermonkey 嘅 @version，確保同腳本一致）
+  const VERSION = (function () {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) return GM_info.script.version;
+    } catch (e) {}
+    return '1.12.0';
+  })();
 
   /* ------------------------------------------------------------------ *
    *  記住用戶選項（Tampermonkey 持久儲存，後備 localStorage）
@@ -428,17 +436,32 @@
   }
 
   /* ------------------------------------------------------------------ *
-   *  記錄 order_list_v4 嘅「請求」（url + body）
-   *  用途：自己直接分頁呼叫 API，唔靠滾動，確保攞齊所有訂單
-   *  （包括由快取還原、從未經過攔截嘅頂部最新訂單）
+   *  記錄 order_list_v4 嘅「請求」（url + body），可能有多條
+   *  用途：自己直接分頁呼叫 API，唔靠滾動。
+   *  ※ 要小心「返回」請求（URL 有 is_back=1 / body 有 order_index），
+   *    佢係「還原到上次位置」嘅特別請求，會令列表由中間開始 → 漏咗最新訂單。
+   *    所以要揀最乾淨嗰條，並且剔除 is_back / order_index。
    * ------------------------------------------------------------------ */
-  let lastOrderReq = null;
+  const orderReqs = [];
   function noteOrderReq(url, body) {
     try {
-      if (!url || String(url).indexOf('order_list_v4') === -1) return;
-      lastOrderReq = { url: String(url), body: body == null ? '' : String(body) };
-      dbg('order_list_v4 req noted');
+      const u = String(url || '');
+      if (u.indexOf('order_list_v4') === -1) return;
+      const b = body == null ? '' : String(body);
+      // 去重
+      for (const r of orderReqs) if (r.url === u && r.body === b) return;
+      orderReqs.push({ url: u, body: b });
+      if (orderReqs.length > 8) orderReqs.shift();
+      dbg('order_list_v4 req noted (' + orderReqs.length + ')');
     } catch (e) {}
+  }
+
+  // 揀最「乾淨」（冇 is_back / order_index）嘅請求；冇就用最近嗰條
+  function pickOrderReq() {
+    if (!orderReqs.length) return null;
+    const isDirty = (r) => /[?&]is_back=/.test(r.url) || /order_index/.test(r.body || '');
+    for (let i = orderReqs.length - 1; i >= 0; i--) if (!isDirty(orderReqs[i])) return orderReqs[i];
+    return orderReqs[orderReqs.length - 1];
   }
 
   // 由原始訂單物件直接取日期（YYYY-MM-DD），唔使經 normalize
@@ -590,12 +613,24 @@
    *  由 offset 0 開始，一頁一頁攞，唔靠滾動／唔靠 UI 有冇 render。
    *  因為係新→舊，所以若已越過「從」日期就可以停。
    * ------------------------------------------------------------------ */
+  // 診斷：記錄 API 分頁過程
+  let apiDbg = { url: null, body: null, pages: [], done: false };
+
   function resolveOrderApiUrl() {
-    if (lastOrderReq && lastOrderReq.url) return lastOrderReq.url;
+    const req = pickOrderReq();
+    if (req && req.url) {
+      try {
+        const u = new URL(req.url, location.href);
+        u.searchParams.delete('is_back');                 // 剔除「返回」標記
+        return u.toString();
+      } catch (e) { return req.url; }
+    }
     // 後備 1：由 performance 資源記錄搵返
     try {
       const entries = performance.getEntriesByType('resource') || [];
-      for (const e of entries) if (e.name && e.name.indexOf('order_list_v4') !== -1) return e.name;
+      for (const e of entries) if (e.name && e.name.indexOf('order_list_v4') !== -1) {
+        try { const u = new URL(e.name, location.href); u.searchParams.delete('is_back'); return u.toString(); } catch (e2) { return e.name; }
+      }
     } catch (e) {}
     // 後備 2：用 cookie 嘅 pdd_user_id 砌返
     try {
@@ -605,16 +640,28 @@
     return null;
   }
 
+  // 由擷取到嘅請求砌出乾淨嘅 body 模板（剔除位置／返回相關欄位）
+  function buildOrderBodyTemplate() {
+    const req = pickOrderReq();
+    let tmpl = {};
+    try { if (req && req.body) tmpl = JSON.parse(req.body) || {}; } catch (e) { tmpl = {}; }
+    if (!tmpl || typeof tmpl !== 'object' || Array.isArray(tmpl)) tmpl = {};
+    delete tmpl.order_index;
+    delete tmpl.is_back;
+    if (tmpl.size == null) tmpl.size = 50;
+    if (tmpl.page_from == null) tmpl.page_from = 0;
+    return tmpl;
+  }
+
   async function fetchAllByApi() {
     const url = resolveOrderApiUrl();
     if (!url) { dbg('no order_list_v4 url'); return false; }
     let base;
     try { base = new URL(url, location.href); } catch (e) { return false; }
-    let tmpl = {};
-    try { if (lastOrderReq && lastOrderReq.body) tmpl = JSON.parse(lastOrderReq.body) || {}; } catch (e) { tmpl = {}; }
-    if (!tmpl || typeof tmpl !== 'object' || Array.isArray(tmpl)) tmpl = {};
-    if (tmpl.size == null) tmpl.size = 50;
+    const tmpl = buildOrderBodyTemplate();
     const size = Number(tmpl.size) > 0 ? Number(tmpl.size) : 50;
+    apiDbg = { url: base.toString(), body: Object.assign({}, tmpl), pages: [], done: false };
+    dbg('api url=' + base.toString() + ' body=' + JSON.stringify(tmpl));
 
     let offset = 0, page = 1, runMin = null, gotAny = false, prevFirst = null;
     let effSize = size;
@@ -636,28 +683,53 @@
       const list = (json && (json.orders || (json.result && (json.result.orders || json.result.list)))) || [];
       if (!Array.isArray(list) || !list.length) { dbg('api page ' + page + ' empty -> stop'); break; }
       gotAny = true;
-      // 用第一頁實際長度做「頁長」基準（API 可能唔跟我們要求嘅 size）
       if (page === 1) effSize = list.length || size;
-      // 防止 API 唔理 offset 造成無限迴圈
       const firstSn = getOrderSn(list[0]) || '';
       if (firstSn && firstSn === prevFirst) { dbg('api page ' + page + ' repeated -> stop'); break; }
       prevFirst = firstSn;
 
+      let pMin = null, pMax = null;
       for (const o of list) {
         const d = rawDate(o);
+        if (d) { if (!pMin || d < pMin) pMin = d; if (!pMax || d > pMax) pMax = d; }
         if (d && (!runMin || d < runMin)) runMin = d;
         addOrder(o, 'API 分頁');
       }
+      apiDbg.pages.push({ page, offset, got: list.length, min: pMin, max: pMax });
       renderStats();
-      dbg('api page ' + page + ' off=' + offset + ' got=' + list.length + ' min=' + runMin);
+      dbg('api page ' + page + ' off=' + offset + ' got=' + list.length + ' range=' + pMin + '~' + pMax);
       if (list.length < effSize) break;                    // 最後一頁
-      // 已越過「從」日期 => 後面更舊，唔使再攞（快速模式）
       if (settings.fastStop && settings.dateFrom && runMin && runMin <= settings.dateFrom) break;
       offset += effSize; page++;
       await sleep(120);
     }
+    apiDbg.done = true;
     dbg('api paging done. pages=' + page + ' spanMin=' + runMin);
     return gotAny;
+  }
+
+  // 探測：比較幾個 body 變體，睇邊個攞到最新訂單（診斷用）
+  async function probe() {
+    const url = resolveOrderApiUrl();
+    if (!url) return { error: 'no url' };
+    const tmpl = buildOrderBodyTemplate();
+    const variants = {
+      picked: tmpl,
+      minimal: { type: (tmpl.type == null ? 0 : tmpl.type), page: 1, size: 50, offset: 0, page_from: 0, origin_host_name: location.hostname },
+    };
+    const out = {};
+    for (const name in variants) {
+      try {
+        const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Accept': 'application/json, text/plain, */*' }, body: JSON.stringify(variants[name]), credentials: 'include' });
+        const j = await r.json();
+        const list = (j && (j.orders || (j.result && (j.result.orders || j.result.list)))) || [];
+        let mn = null, mx = null;
+        for (const o of list) { const d = rawDate(o); if (d) { if (!mn || d < mn) mn = d; if (!mx || d > mx) mx = d; } }
+        out[name] = { body: variants[name], got: list.length, min: mn, max: mx, firstSn: list[0] ? getOrderSn(list[0]) : null };
+      } catch (e) { out[name] = { error: String(e && e.message || e) }; }
+      await sleep(150);
+    }
+    return out;
   }
 
   /* ------------------------------------------------------------------ *
@@ -871,7 +943,9 @@
       helpBody: host.querySelector('.pdd-help-body'),
       lang: host.querySelector('.pdd-lang'),
       fastStop: host.querySelector('.pdd-fast'),
+      ver: host.querySelector('.pdd-ver'),
     };
+    if (els.ver) els.ver.textContent = 'v' + VERSION;
 
     els.fab.addEventListener('click', () => els.panel.classList.toggle('pdd-open'));
     els.toggle.addEventListener('click', () => els.panel.classList.remove('pdd-open'));
@@ -987,6 +1061,7 @@
   // 診斷：把所有關鍵資訊一次過 dump 出嚟
   function diag() {
     const out = {};
+    out.version = VERSION;
     try { out.url = location.href; } catch (e) {}
     try { out.title = document.title; } catch (e) {}
     out.captured = Object.keys(ORDER).length;
@@ -994,6 +1069,11 @@
     out.detectedRange = { from: settings.dateFrom, to: settings.dateTo };
     out.interceptCount = interceptCount;
     out.lastUrl = lastUrl;
+    // 擷取到嘅 order_list_v4 請求（睇下有冇 is_back / order_index 污染）
+    out.orderReqs = orderReqs.map((r) => ({ url: r.url, body: r.body }));
+    out.pickedReq = pickOrderReq();
+    // 自己分頁呼叫 API 嘅過程
+    out.api = apiDbg;
     out.samples = interceptSamples.slice(0, 6);
     // DOM：各種候選 selector 命中數
     out.selectors = {};
@@ -1288,6 +1368,7 @@
       transition:opacity .16s ease;}
     .pdd-cols-all:hover{opacity:.75;}
     .pdd-note{font-size:11px;color:var(--pdd-muted);margin-top:10px;line-height:1.5;}
+    .pdd-ver{margin-top:8px;font-size:10.5px;color:var(--pdd-muted);text-align:right;opacity:.75;user-select:text;}
     .pdd-help{position:absolute;inset:0;z-index:6;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;
       opacity:0;visibility:hidden;pointer-events:none;border-radius:14px;transition:opacity .22s ease,visibility 0s linear .22s;}
     .pdd-help.pdd-open{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .22s ease,visibility 0s;}
@@ -1347,6 +1428,7 @@
 
       <button class="pdd-search" data-i18n="search">搜尋 & 匯出 Excel</button>
       <p class="pdd-note" data-i18n="note">撳「搜尋」後會自動載入訂單，只匯出所揀日期範圍內嘅訂單。</p>
+      <div class="pdd-ver"></div>
     </div>
 
     <div class="pdd-help">
@@ -1393,7 +1475,7 @@
   unsafeWindow.__pddOrderExport = {
     ORDER, RAW, filtered, settings,
     exportXlsx, exportCsv, autoLoadAll, scanPage, cancelSearch, scanDom, collectFromDom,
-    diag, findScroller, scrollToBottom, scrollToTop, capturedSpan, fetchAllByApi,
+    diag, findScroller, scrollToBottom, scrollToTop, capturedSpan, fetchAllByApi, probe, version: VERSION,
     debug: (on = true) => { unsafeWindow.__pddDebug = !!on; },
     theme: () => ({ mode: themeMode, dark: effectiveDark() }),
     setTheme: (m) => { themeMode = m || ''; store.set('theme', themeMode); if (els) applyTheme(); },
