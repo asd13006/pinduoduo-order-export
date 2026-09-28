@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多買家訂單匯出 (增強版)
 // @namespace    https://github.com/DSH/pdd-order-export
-// @version      1.12.1
+// @version      1.12.2
 // @description  自動攔截拼多多網頁版買家訂單資料，自動載入訂單、日期範圍篩選、自選匯出欄位（記住選項），一鍵匯出 Excel(.xlsx)/CSV。
 // @author       leolai
 // @match        https://mobile.pinduoduo.com/*
@@ -38,7 +38,7 @@
     try {
       if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) return GM_info.script.version;
     } catch (e) {}
-    return '1.12.1';
+    return '1.12.2';
   })();
 
   /* ------------------------------------------------------------------ *
@@ -207,10 +207,17 @@
     { key: 'qty' }, { key: 'amount' }, { key: 'mall' }, { key: 'status' }, { key: 'type' }, { key: 'buyUrl' },
   ];
   const colLabel = (c) => t('col.' + c.key);
+
+  // 預設匯出欄位：只揀最常用嘅 5 欄（其餘可自行勾選）
+  const DEFAULT_SELECTED = {
+    createAt: true, orderSn: false, name: true, spec: false, price: true,
+    qty: true, amount: true, mall: false, status: false, type: false, buyUrl: false,
+  };
+  const SEL_VER = 2;                       // 預設欄位版本（升級時用）
   const settings = {
     divide100: false,             // 若數量單位係「分」，開啟後全數除以 100
     fastStop: false,              // 只在「已載到日期下限」就停（預設關，確保唔漏單）
-    selected: Object.fromEntries(COLUMNS.map((c) => [c.key, true])),
+    selected: Object.fromEntries(COLUMNS.map((c) => [c.key, DEFAULT_SELECTED[c.key] !== false])),
     dateFrom: '',                 // 'YYYY-MM-DD'
     dateTo: '',
     keyword: '',
@@ -220,8 +227,16 @@
    *  載入上次嘅選項（只記「匯出欄位」，日期範圍唔記）
    * ------------------------------------------------------------------ */
   try {
-    const sSel = store.get('selected', null);
-    if (sSel && typeof sSel === 'object') for (const c of COLUMNS) if (typeof sSel[c.key] === 'boolean') settings.selected[c.key] = sSel[c.key];
+    const savedVer = Number(store.get('selVer', 1)) || 1;
+    if (savedVer >= SEL_VER) {
+      // 用返用戶自己揀過嘅欄位
+      const sSel = store.get('selected', null);
+      if (sSel && typeof sSel === 'object') for (const c of COLUMNS) if (typeof sSel[c.key] === 'boolean') settings.selected[c.key] = sSel[c.key];
+    } else {
+      // 版本升級：套用新嘅預設欄位（並記住已升級）
+      store.set('selVer', SEL_VER);
+      store.set('selected', settings.selected);
+    }
   } catch (e) {}
   const saveSelected = () => store.set('selected', settings.selected);
 
