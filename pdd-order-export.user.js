@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多買家訂單匯出 (增強版)
 // @namespace    https://github.com/DSH/pdd-order-export
-// @version      1.12.0
+// @version      1.12.1
 // @description  自動攔截拼多多網頁版買家訂單資料，自動載入訂單、日期範圍篩選、自選匯出欄位（記住選項），一鍵匯出 Excel(.xlsx)/CSV。
 // @author       leolai
 // @match        https://mobile.pinduoduo.com/*
@@ -38,7 +38,7 @@
     try {
       if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) return GM_info.script.version;
     } catch (e) {}
-    return '1.12.0';
+    return '1.12.1';
   })();
 
   /* ------------------------------------------------------------------ *
@@ -663,11 +663,14 @@
     apiDbg = { url: base.toString(), body: Object.assign({}, tmpl), pages: [], done: false };
     dbg('api url=' + base.toString() + ' body=' + JSON.stringify(tmpl));
 
-    let offset = 0, page = 1, runMin = null, gotAny = false, prevFirst = null;
+    // ★ 分頁只推進 offset，page 固定（同「多多開」一致）。
+    //   如果同時推進 page 同 offset，而 API 係計 page*size+offset，就會跳空漏單。
+    const fixedPage = (tmpl.page != null && Number(tmpl.page) > 0) ? Number(tmpl.page) : 1;
+    let offset = 0, iter = 1, runMin = null, gotAny = false, prevFirst = null;
     let effSize = size;
     for (let i = 0; i < 300; i++) {
       if (cancelled) break;
-      const body = Object.assign({}, tmpl, { offset: offset, page: page, size: size });
+      const body = Object.assign({}, tmpl, { offset: offset, page: fixedPage, size: size });
       let json = null;
       try {
         const r = await fetch(base.toString(), {
@@ -676,16 +679,16 @@
           body: JSON.stringify(body),
           credentials: 'include',
         });
-        if (!r || r.status >= 400) { dbg('api page http ' + (r && r.status)); break; }
+        if (!r || r.status >= 400) { dbg('api page ' + iter + ' http ' + (r && r.status)); break; }
         json = await r.json();
-      } catch (e) { dbg('api page err ' + (e && e.message)); break; }
+      } catch (e) { dbg('api page ' + iter + ' err ' + (e && e.message)); break; }
 
       const list = (json && (json.orders || (json.result && (json.result.orders || json.result.list)))) || [];
-      if (!Array.isArray(list) || !list.length) { dbg('api page ' + page + ' empty -> stop'); break; }
+      if (!Array.isArray(list) || !list.length) { dbg('api page ' + iter + ' empty -> stop'); break; }
       gotAny = true;
-      if (page === 1) effSize = list.length || size;
+      if (iter === 1) effSize = list.length || size;
       const firstSn = getOrderSn(list[0]) || '';
-      if (firstSn && firstSn === prevFirst) { dbg('api page ' + page + ' repeated -> stop'); break; }
+      if (firstSn && firstSn === prevFirst) { dbg('api page ' + iter + ' repeated -> stop'); break; }
       prevFirst = firstSn;
 
       let pMin = null, pMax = null;
@@ -695,16 +698,16 @@
         if (d && (!runMin || d < runMin)) runMin = d;
         addOrder(o, 'API 分頁');
       }
-      apiDbg.pages.push({ page, offset, got: list.length, min: pMin, max: pMax });
+      apiDbg.pages.push({ page: iter, offset, got: list.length, min: pMin, max: pMax });
       renderStats();
-      dbg('api page ' + page + ' off=' + offset + ' got=' + list.length + ' range=' + pMin + '~' + pMax);
+      dbg('api page ' + iter + ' off=' + offset + ' got=' + list.length + ' range=' + pMin + '~' + pMax);
       if (list.length < effSize) break;                    // 最後一頁
       if (settings.fastStop && settings.dateFrom && runMin && runMin <= settings.dateFrom) break;
-      offset += effSize; page++;
+      offset += effSize; iter++;
       await sleep(120);
     }
     apiDbg.done = true;
-    dbg('api paging done. pages=' + page + ' spanMin=' + runMin);
+    dbg('api paging done. pages=' + iter + ' spanMin=' + runMin);
     return gotAny;
   }
 
