@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多買家訂單匯出 (增強版)
 // @namespace    https://github.com/DSH/pdd-order-export
-// @version      1.9.0
+// @version      1.9.1
 // @description  自動攔截拼多多網頁版買家訂單資料，自動載入訂單、日期範圍篩選、自選匯出欄位（記住選項），一鍵匯出 Excel(.xlsx)/CSV。
 // @author       leolai
 // @match        https://mobile.pinduoduo.com/*
@@ -76,7 +76,7 @@
       'status.stopped': '已停止（已搵到 {n} 筆）', 'status.stopping': '正在停止…',
       'status.error': '出錯：{msg}',
       'status.scanning': '掃描中…', 'status.scanDone': '掃描完', 'status.scanNone': '掃描完，未搵到訂單', 'status.scanErr': '掃描出錯',
-      'stats.obtained': '已取得 {n} 筆訂單', 'stats.total': '合計 ¥{amt}',
+      'stats.obtained': '已取得 {n} 筆訂單', 'stats.total': '合計 ¥{amt}', 'stats.span': '日期 {from} ~ {to}',
       'col.createAt': '下單時間', 'col.orderSn': '訂單號', 'col.name': '商品名稱', 'col.spec': '規格',
       'col.price': '單價', 'col.qty': '數量', 'col.amount': '實付金額(元)', 'col.mall': '店鋪',
       'col.status': '狀態', 'col.type': '類型', 'col.buyUrl': '購買連結',
@@ -114,7 +114,7 @@
       'status.stopped': '已停止（已找到 {n} 笔）', 'status.stopping': '正在停止…',
       'status.error': '出错：{msg}',
       'status.scanning': '扫描中…', 'status.scanDone': '扫描完成', 'status.scanNone': '扫描完成，未找到订单', 'status.scanErr': '扫描出错',
-      'stats.obtained': '已获取 {n} 笔订单', 'stats.total': '合计 ¥{amt}',
+      'stats.obtained': '已获取 {n} 笔订单', 'stats.total': '合计 ¥{amt}', 'stats.span': '日期 {from} ~ {to}',
       'col.createAt': '下单时间', 'col.orderSn': '订单号', 'col.name': '商品名称', 'col.spec': '规格',
       'col.price': '单价', 'col.qty': '数量', 'col.amount': '实付金额(元)', 'col.mall': '店铺',
       'col.status': '状态', 'col.type': '类型', 'col.buyUrl': '购买链接',
@@ -152,7 +152,7 @@
       'status.stopped': 'Stopped (found {n})', 'status.stopping': 'Stopping…',
       'status.error': 'Error: {msg}',
       'status.scanning': 'Scanning…', 'status.scanDone': 'Scan complete', 'status.scanNone': 'Scanned, no orders found', 'status.scanErr': 'Scan error',
-      'stats.obtained': 'Captured {n} orders', 'stats.total': 'Total ¥{amt}',
+      'stats.obtained': 'Captured {n} orders', 'stats.total': 'Total ¥{amt}', 'stats.span': 'Dates {from} ~ {to}',
       'col.createAt': 'Order time', 'col.orderSn': 'Order No.', 'col.name': 'Product', 'col.spec': 'Spec',
       'col.price': 'Unit price', 'col.qty': 'Qty', 'col.amount': 'Paid (CNY)', 'col.mall': 'Store',
       'col.status': 'Status', 'col.type': 'Type', 'col.buyUrl': 'Link',
@@ -518,6 +518,46 @@
   }
 
   /* ------------------------------------------------------------------ *
+   *  DOM 卡片擷取（第三條路）
+   *  拼多多訂單卡有 data-order-sn / data-order-time / data-order-amount /
+   *  data-mall-name 等 attribute。首屏（嵌入／SSR）嘅訂單唔經 XHR，
+   *  只有 DOM 睇得到，所以一定要讀 DOM 先捉得齊。
+   *  ※ DOM 顯示值係「元」，所以用 camelCase key（唔會被當成「分」）。
+   * ------------------------------------------------------------------ */
+  function collectFromDom() {
+    const out = [];
+    let nodes;
+    try { nodes = document.querySelectorAll('[data-order-sn]'); } catch (e) { return out; }
+    for (const el of nodes) {
+      const d = el.dataset || {};
+      const sn = d.orderSn;
+      if (!sn) continue;
+      out.push({
+        orderSn: sn,
+        orderTime: d.orderTime,
+        orderStatusPrompt: d.orderStatus,
+        orderAmount: d.orderAmount,                       // 元
+        orderGoods: [{
+          goodsId: d.goodsId,
+          goodsName: d.orderGoods || d.goodsName,
+          spec: d.goodsSpec || d.spec,
+          goodsNumber: parseInt(d.goodsNumber, 10) || 1,
+          goodsPrice: d.goodsPrice,                       // 元
+        }],
+        mall: { mallName: d.mallName },
+      });
+    }
+    return out;
+  }
+
+  function scanDom() {
+    let any = false;
+    for (const o of collectFromDom()) if (addOrder(o, 'DOM 卡片')) any = true;
+    if (any && windowOn()) scheduleRender();
+    return any;
+  }
+
+  /* ------------------------------------------------------------------ *
    *  網路攔截：hook fetch + XMLHttpRequest
    * ------------------------------------------------------------------ */
   function hookNetwork() {
@@ -584,6 +624,10 @@
     if (autoLoading) return;
     autoLoading = true;
     setStatus(t('status.loading'));
+    // 先返最頂，確保係由「最新」開始向下載，提早停止先至可靠
+    try { window.scrollTo(0, 0); } catch (e) {}
+    await sleep(350);
+    scanDom();
     let prev = Object.keys(ORDER).length;
     let stable = 0;
     let passedStart = 0;
@@ -591,6 +635,7 @@
     for (let i = 0; i < 260; i++) {
       window.scrollTo(0, document.body.scrollHeight);
       await sleep(600);
+      scanDom();                                              // 每輪都讀返已渲染嘅卡片
       const n = Object.keys(ORDER).length;
       if (n === prev) { stable++; } else { stable = 0; prev = n; }
       renderStats();
@@ -599,7 +644,7 @@
       if (settings.dateFrom) {
         const od = oldestDate();
         if (od && od <= settings.dateFrom) passedStart++; else passedStart = 0;
-        if (passedStart >= 2) break;
+        if (passedStart >= 3) break;
       }
       if (stable >= 5) break;                                  // 到底
       if (Date.now() - startAt > 45000) break;                 // 硬上限
@@ -761,7 +806,22 @@
     if (!els) return;
     const all = Object.values(ORDER);
     const totalAmount = all.reduce((s, r) => s + (Number.isNaN(toNum(r.amount)) ? 0 : toNum(r.amount)), 0);
-    els.stats.textContent = t('stats.obtained', { n: all.length }) + '  |  ' + t('stats.total', { amt: fmtMoney(totalAmount) });
+    let line = t('stats.obtained', { n: all.length }) + '  |  ' + t('stats.total', { amt: fmtMoney(totalAmount) });
+    const span = capturedSpan();
+    if (span.min) line += '  |  ' + t('stats.span', { from: span.min, to: span.max });
+    els.stats.textContent = line;
+  }
+
+  // 已捕捉訂單嘅日期範圍（用嚟確認有冇載齊）
+  function capturedSpan() {
+    let min = null, max = null;
+    for (const r of Object.values(ORDER)) {
+      if (!r.createAt) continue;
+      const d = r.createAt.slice(0, 10);
+      if (!min || d < min) min = d;
+      if (!max || d > max) max = d;
+    }
+    return { min, max };
   }
 
   function scheduleRender() {
@@ -1103,6 +1163,9 @@
 
     // 讓已存在嘅訂單資料（若頁面先前已載入）有機會被捕獲
     setInterval(() => { if (windowOn() && !els) registerUI(); }, 1500);
+
+    // 定時讀 DOM 卡片：連唔經 XHR / 首屏嵌入嘅訂單都捉到
+    setInterval(() => { if (windowOn()) scanDom(); }, 1500);
   }
 
   // menu 指令
@@ -1120,7 +1183,7 @@
   // 對外暴露（方便 debug）
   unsafeWindow.__pddOrderExport = {
     ORDER, RAW, filtered, settings,
-    exportXlsx, exportCsv, autoLoadAll, scanPage, cancelSearch,
+    exportXlsx, exportCsv, autoLoadAll, scanPage, cancelSearch, scanDom, collectFromDom,
     debug: (on = true) => { unsafeWindow.__pddDebug = !!on; },
     theme: () => ({ mode: themeMode, dark: effectiveDark() }),
     setTheme: (m) => { themeMode = m || ''; store.set('theme', themeMode); if (els) applyTheme(); },
